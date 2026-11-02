@@ -14,6 +14,66 @@
 </p>
 <p align="center">macOS / Metal &nbsp;·&nbsp; Linux / CUDA &nbsp;·&nbsp; Windows (in progress)</p>
 
+> [!NOTE]
+> **Unofficial fork.** This is [hammedrz/inferssd-gemma4](https://github.com/hammedrz/inferssd-gemma4), a fork of
+> [wici-ai/inferssd](https://github.com/wici-ai/inferssd) that adds smaller mixture-of-experts models. It is not
+> affiliated with or endorsed by WiCi AI. Below this section the README is upstream's, with the install command
+> pointed at this fork.
+
+## About this fork
+
+This fork streams the routed experts of two smaller MoE architectures from the SSD, in addition to the models
+upstream supports:
+
+| Model | GGUF architecture | Parameters | Tested GGUF |
+| --- | --- | --- | --- |
+| DeepSeek-V2-Lite-Chat | `deepseek2` | 15.7B total / 2.4B active | [mradermacher · Q8_0](https://huggingface.co/mradermacher/DeepSeek-V2-Lite-Chat-GGUF) |
+| Gemma 4 26B-A4B-it | `gemma4` | 25.8B total / about 4B active | [Unsloth · UD-Q4_K_XL](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) |
+
+Dense models of the same architectures, such as Gemma 4 E4B, have no routed experts and are not supported.
+Run a downloaded file with `inferssd cli -m /path/to/model.gguf` or `inferssd serve -m /path/to/model.gguf`.
+
+### Changes from upstream
+
+- **CPU expert executor:** GELU-gated experts (`GEGLU`, computed with ggml's own kernel, so values match the
+  graph) and an optional per-expert down-projection scale, applied in the graph's order: the down output times
+  the scale, then the routing weight. The CPU backend initializes ggml's GELU table when an executor is created.
+- **Merged gate/up experts:** Gemma 4 stores each expert's gate and up rows in one `ffn_gate_up_exps` tensor. The
+  engine describes its two halves to the executor as separate gate and up tensors, and the GGUF alias index
+  splits each expert's bytes the same way.
+- **Model support:** the model adapter accepts `deepseek2` and `gemma4`; the launcher maps both to a `gguf`
+  profile that keeps the chat template embedded in the GGUF.
+- **`inferssd cli` and `serve`:** an optional `--memory-gib` caps the memory limit; without it they use all of
+  physical memory as upstream does.
+- **Installer:** builds this fork, and on Linux without a CUDA toolkit builds the CPU-only engine (`linux-cpu`)
+  instead of stopping.
+
+Modified files: `engine/ggml/src/ggml-cpu/ssd/cpu-sink.{h,cpp}`, `engine/ggml/src/ggml-cpu/ssd/cpu-prefill.cpp`,
+`engine/ggml/src/ggml-cpu/ssd/cpu-cache-executor.inc`, `engine/src/llama-graph.cpp`, `engine/src/llama-context.cpp`,
+`engine/src/ssd/cpu-runtime.h`, `engine/src/ssd/model-adapter.{h,cpp}`, `engine/tests/CMakeLists.txt`,
+`engine/tests/ssd/test-kimi-cpu-sink.cpp`, `engine/tests/ssd/test-model-adapter.cpp`,
+`framework/src/inferssd/app/command.py`, `framework/src/inferssd/launch/typed.py`,
+`framework/src/inferssd/source/{experts,gguf_alias}.py`, `framework/src/inferssd/strategy/inputs.py`,
+`scripts/install.sh`, `README.md` and `NOTICE`. The git history records each change.
+
+### Validation
+
+On a Linux laptop with an Intel Core i5-1145G7 (4 cores, 8 threads), 16 GB of RAM, a Crucial P310 NVMe SSD
+and the CPU-only build:
+
+- **Unit tests:** the Gemma 4 expert test (`test-kimi-cpu-sink --gemma4-geglu-test`) matches ggml's MoE graph bit
+  for bit in decode and in 3- and 65-token grouped prefill, for Q4_K/Q5_1 and Q8_0 experts, with and without
+  per-expert scales. The existing CPU executor suites, the model adapter test and the framework tests pass.
+- **DeepSeek-V2-Lite-Chat Q8_0:** 48 of 48 greedy tokens and their log probabilities were identical to the same
+  build without SSD experts. Generation ran at 7.2 token/s against 1.6 token/s without SSD experts (one short
+  run each, not a benchmark).
+- **Gemma 4 26B-A4B UD-Q4_K_XL:** answers are correct and fluent. Before the per-expert scale moved into the
+  executor, the only difference from llama.cpp was that scale's rounding order. Applying the same order in
+  llama.cpp made all 48 tokens identical. The current version has not yet been compared on the full model.
+
+Only the Linux CPU build was tested. A CUDA GPU expert tier refuses GELU-gated experts and per-expert scales
+rather than computing them; macOS was not tested.
+
 **Run models larger than your RAM or VRAM.** InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) to run large mixture-of-experts (MoE) models from SSD, using standard GGUF files, with browser chat and an OpenAI-compatible API. It currently supports **DeepSeek-V4.1-Flash-1017** and **Muse-Spark-Open**, with more models coming.
 
 ## Models
@@ -77,12 +137,12 @@ Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [ha
 Install on Apple Silicon macOS or on Linux with an NVIDIA GPU:
 
 ```sh
-curl -fsSL https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/hammedrz/inferssd-gemma4/main/scripts/install.sh | sh
 ```
 
 InferSSD currently installs from source, so the engine is compiled for your machine's CPU and GPU; prebuilt packages are not available yet. Building takes about 2 to 12 minutes, depending on the machine.
 
-The installer works in a private environment and uses no `sudo`. It needs Git, Python 3.9 or later, and a C/C++ compiler. macOS also needs the Xcode Command Line Tools; Linux also needs the CUDA toolkit, `liburing` headers, and systemd with cgroup v2. Follow the printed PATH instruction if it shows one.
+The installer works in a private environment and uses no `sudo`. It needs Git, Python 3.9 or later with `venv` (on Debian and Ubuntu, the `python3-venv` package), and a C/C++ compiler. macOS also needs the Xcode Command Line Tools. Linux needs systemd with cgroup v2; with the CUDA toolkit it builds the CUDA engine, which also needs `liburing` headers, and without it this fork builds the CPU-only engine. Follow the printed PATH instruction if it shows one.
 
 Then start a model:
 

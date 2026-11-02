@@ -1,6 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
-# Usage: curl -fsSL https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/hammedrz/inferssd-gemma4/main/scripts/install.sh | sh
+# This installer builds the hammedrz/inferssd-gemma4 fork, not the upstream wici-ai/inferssd.
 set -eu
 
 # The release workflow replaces this with the tag it publishes.
@@ -12,11 +13,13 @@ need() { command -v "$1" >/dev/null 2>&1 || die "Install $1 first. See docs/quic
 main() (
     if [ "${1:-}" = --help ]; then
         cat <<'EOF'
-Install InferSSD from source for Apple Silicon / Metal or Linux / NVIDIA CUDA.
+Install InferSSD (the inferssd-gemma4 fork) from source for Apple Silicon / Metal,
+Linux / NVIDIA CUDA, or Linux on the CPU alone.
 Requires Git, Python >=3.9 with venv and a C/C++ compiler.
 macOS requires the Xcode Command Line Tools.
-Linux requires the CUDA toolkit, liburing development headers and systemd/cgroup v2
-at runtime.
+Linux builds the CUDA engine when the CUDA toolkit is present, which also requires
+liburing development headers, and the CPU-only engine otherwise. Linux requires
+systemd/cgroup v2 at runtime.
 CMake, Ninja and the Python framework are installed in a private environment.
 
 Environment:
@@ -46,21 +49,26 @@ EOF
             preset=macos-metal
             ;;
         Linux:x86_64|Linux:aarch64|Linux:arm64)
-            preset=linux-cuda
             if [ -z "${CUDACXX:-}" ]; then
                 if command -v nvcc >/dev/null 2>&1; then
                     CUDACXX=$(command -v nvcc)
                 elif [ -x /usr/local/cuda/bin/nvcc ]; then
                     CUDACXX=/usr/local/cuda/bin/nvcc
-                else
-                    die 'Install the CUDA toolkit or set CUDACXX to nvcc.'
                 fi
             fi
-            export CUDACXX
-            printf '#include <liburing.h>\n' | cc -E - >/dev/null 2>&1 ||
-                die 'Install liburing development headers (e.g. liburing-dev).'
+            if [ -n "${CUDACXX:-}" ]; then
+                preset=linux-cuda
+                export CUDACXX
+                printf '#include <liburing.h>\n' | cc -E - >/dev/null 2>&1 ||
+                    die 'Install liburing development headers (e.g. liburing-dev).'
+            else
+                # Without a GPU the CPU executor computes every routed expert; it reads through
+                # direct syscalls, so liburing is not needed either.
+                preset=linux-cpu
+                printf 'No CUDA toolkit found: building the CPU-only engine.\n'
+            fi
             ;;
-        *) die 'Supported platforms: Apple Silicon macOS and NVIDIA CUDA Linux x86_64/ARM64.' ;;
+        *) die 'Supported platforms: Apple Silicon macOS and Linux x86_64/ARM64.' ;;
     esac
     install_home=${INFERSSD_HOME:-"$HOME/.local/share/inferssd"}
     bin_dir=${INFERSSD_BIN_DIR:-"$HOME/.local/bin"}
@@ -76,7 +84,7 @@ EOF
     trap 'exit 143' TERM
     printf 'Building InferSSD (%s). This may take several minutes.\n' "$preset"
     git clone --depth 1 --branch "${INFERSSD_REF:-$DEFAULT_REF}" \
-        https://github.com/wici-ai/inferssd.git "$release/source"
+        https://github.com/hammedrz/inferssd-gemma4.git "$release/source"
     python3 -m venv "$release/venv"
     py="$release/venv/bin/python"
     "$py" -m pip install --upgrade pip
@@ -144,6 +152,9 @@ Start the OpenAI-compatible API:
 
 Muse:
   inferssd serve -hf unsloth/Muse-Spark-Open-816B-A42B-GGUF
+
+DeepSeek-V2 and Gemma 4 GGUF files you have downloaded (this fork):
+  inferssd cli -m /path/to/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
 EOF
 )
 

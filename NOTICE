@@ -118,3 +118,16 @@ External runtime dependencies
 
 liburing is not vendored. Binary distributions must comply with its selected
 license (the MIT option is available) and the NVIDIA CUDA runtime terms.
+
+Modifications in the inferssd-gemma4 fork
+=========================================
+
+https://github.com/hammedrz/inferssd-gemma4 is an unofficial fork of InferSSD,
+not affiliated with or endorsed by WiCi AI. It adds SSD streaming of the routed
+experts of DeepSeek-V2 and Gemma 4 GGUF models, GELU-gated experts and
+per-expert down scales in the CPU expert executor, and a CPU-only Linux
+installer path. README.md ("About this fork") lists the modified files; the
+git history records each change. The notices above continue to apply.
+
+Copyright (c) 2026 hammedrz. These modifications are licensed under the
+Apache License, Version 2.0.
