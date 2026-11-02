@@ -16,7 +16,10 @@ expert_requirements describe_experts(
         case LLM_ARCH_MUSE_SPARK:
             return {expert_quantization::matching_up_gate, expert_activation::swiglu, 0.0f, false, true, false};
         case LLM_ARCH_QWEN4EXP:
+        case LLM_ARCH_DEEPSEEK2:
             return {expert_quantization::matching_up_gate, expert_activation::swiglu, 0.0f, false, false, false};
+        case LLM_ARCH_GEMMA4:
+            return {expert_quantization::matching_up_gate, expert_activation::geglu, 0.0f, false, false, false};
         default:
             return {};
     }
@@ -66,7 +69,11 @@ expert_refusal first_refusal(const expert_requirements & requirements, const exp
     if (has_extra_parameters(in)) { return expert_refusal::extra_parameters; }
     if (in.has_lora) { return expert_refusal::lora; }
     if (!quantization_accepted(requirements.quantization, in)) { return expert_refusal::quantization; }
-    if (!in.silu) { return expert_refusal::not_silu_gated; }
+    if (requirements.activation == expert_activation::geglu) {
+        if (!in.gelu) { return expert_refusal::not_gelu_gated; }
+    } else if (!in.silu) {
+        return expert_refusal::not_silu_gated;
+    }
     if (in.cache_compute) { return expert_refusal::compute_cache; }
     if (requirements.single_token_or_prefill && in.n_tokens != 1 && !in.prefill) {
         return expert_refusal::token_batch;
@@ -105,6 +112,7 @@ std::string describe_refusal(const expert_inputs & in, expert_refusal refusal) {
         case expert_refusal::lora: return "LoRA adapters are not supported with SSD experts";
         case expert_refusal::quantization: return describe_quantization(in);
         case expert_refusal::not_silu_gated: return "routed experts must be SiLU-gated";
+        case expert_refusal::not_gelu_gated: return "this model's routed experts must be GELU-gated";
         case expert_refusal::compute_cache: return "the expert compute cache is not supported with SSD experts";
         case expert_refusal::token_batch: return "this model runs routed experts one token at a time outside prefill";
         case expert_refusal::invalid_clamp: return "the model's SwiGLU clamp must be finite and positive";

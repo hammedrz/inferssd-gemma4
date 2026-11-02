@@ -34,6 +34,9 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
         parser.add_argument("--resources", type=Path, help=argparse.SUPPRESS)
         parser.add_argument("--port", type=int, default=8080)
         parser.add_argument("--context", type=int, default=8192)
+        parser.add_argument(
+            "--memory-gib", type=float, help="memory limit for the engine (default: physical RAM)"
+        )
         parser.add_argument("--settings", type=Path, help=argparse.SUPPRESS)
         parser.add_argument(
             "--set", dest="overrides", action="append", default=[], help=argparse.SUPPRESS
@@ -95,7 +98,12 @@ def run(args: argparse.Namespace) -> int:
     state.mkdir(parents=True, exist_ok=True)
     policy_path = state / ("policy-" + uuid.uuid4().hex + ".json")
     # Keep the policy alongside launch receipts for reproducibility.
-    policy_path.write_text(json.dumps(default_policy(state), indent=2) + "\n")
+    policy = default_policy(state)
+    if args.memory_gib is not None:
+        if args.memory_gib <= 0:
+            raise ValueError("memory-gib must be positive")
+        policy["memory_budget_bytes"] = int(args.memory_gib * 2**30)
+    policy_path.write_text(json.dumps(policy, indent=2) + "\n")
     if args.hf_repo:
         selection(args.hf_repo)
         model = download(args.hf_repo, args.revision, args.model_dir.expanduser().resolve())

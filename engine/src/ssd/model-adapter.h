@@ -12,7 +12,7 @@ namespace llama_ssd {
 // Model facts remain in L3. Neither this description nor its validator knows
 // an executor's private cache, kernels, worker threads, or I/O implementation.
 enum class expert_quantization { unsupported, all_mxfp4, matching_up_gate };
-enum class expert_activation { unsupported, swiglu_clamp, swiglu };
+enum class expert_activation { unsupported, swiglu_clamp, swiglu, geglu };
 
 struct expert_requirements {
     expert_quantization quantization = expert_quantization::unsupported;
@@ -44,6 +44,7 @@ struct expert_inputs {
     int64_t n_embd;
     int64_t n_tokens;
     bool silu;
+    bool gelu;
     bool cache_compute;
     bool prefill;
     bool weight_before_ffn;
@@ -74,6 +75,7 @@ enum class expert_refusal {
     lora,
     quantization,
     not_silu_gated,
+    not_gelu_gated,
     compute_cache,
     token_batch,
     invalid_clamp,

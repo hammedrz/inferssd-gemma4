@@ -72,7 +72,7 @@ NATIVE_TYPES = {
     40: ("NVFP4", 64, 36),
     41: ("Q1_0", 128, 18),
 }
-EXPERT_RE = re.compile(r"^blk\.(?P<layer>\d+)\.ffn_(?P<kind>up|gate|down)_exps\.weight$")
+EXPERT_RE = re.compile(r"^blk\.(?P<layer>\d+)\.ffn_(?P<kind>up|gate|down|gate_up)_exps\.weight$")
 SHARD_RE = re.compile(r"(.+)-(\d{5})-of-(\d{5})\.gguf$")
 FIELDS = (
     "tensor",
@@ -396,59 +396,72 @@ def build_rows(
         for tensor in header.tensors:
             match = EXPERT_RE.fullmatch(tensor.name)
             if tensor.name in all_tensor_names:
-                if match is not None and match.group("kind") in include_kinds:
+                if match is not None and match.group("kind") in include_kinds | {"gate_up"}:
                     raise RuntimeError(f"duplicate expert tensor across shards: {tensor.name}")
                 raise RuntimeError(f"duplicate tensor across shards: {tensor.name}")
             all_tensor_names.add(tensor.name)
-            if match is None or match.group("kind") not in include_kinds:
+            if match is None:
                 continue
-            kind = match.group("kind")
+            layer = int(match.group("layer"))
+            # A merged gate_up tensor holds each expert's gate rows, then its up rows: each half
+            # is indexed under the separate tensor's name, as the runtime describes the halves.
+            merged = match.group("kind") == "gate_up"
+            kinds = ("gate", "up") if merged else (match.group("kind"),)
+            parts = [(index, kind) for index, kind in enumerate(kinds) if kind in include_kinds]
+            if not parts:
+                continue
             seen.add(tensor.name)
             if len(tensor.name.encode("utf-8")) >= 128:
                 raise RuntimeError(f"tensor name too long for runtime key: {tensor.name}")
             count = tensor.shape[2] if len(tensor.shape) == 3 else 0
             if n_experts is None:
                 n_experts = count
-            if not count or count != n_experts:
+            if not count or count != n_experts or (merged and tensor.shape[1] % 2):
                 raise RuntimeError(
-                    f"{tensor.name}: expected 3D tensor with {n_experts or 'routed'} experts, "
-                    f"got {tensor.shape}"
+                    f"{tensor.name}: expected 3D tensor with {n_experts or 'routed'} experts"
+                    f"{' and an even row count' if merged else ''}, got {tensor.shape}"
                 )
             if tensor.nbytes <= 0 or tensor.nbytes % n_experts:
                 raise RuntimeError(
                     f"{tensor.name}: {tensor.nbytes} bytes not divisible by n_experts={n_experts}"
                 )
             expert_bytes = tensor.nbytes // n_experts
+            part_bytes = expert_bytes // len(kinds)
             type_name = NATIVE_TYPES[tensor.type_id][0]
-            for expert in range(n_experts):
-                offset = tensor.offset + expert * expert_bytes
-                aligned = offset % ALIGNMENT == 0 and expert_bytes % ALIGNMENT == 0
-                if not aligned:
-                    unaligned_rows += 1
-                    if require_aligned:
-                        raise RuntimeError(
-                            f"{tensor.name}:{expert}: unaligned offset={offset} "
-                            f"nbytes={expert_bytes}"
+            for index, kind in parts:
+                name = f"blk.{layer}.ffn_{kind}_exps.weight" if merged else tensor.name
+                if merged:
+                    if name in all_tensor_names:
+                        raise RuntimeError(f"{tensor.name}: its {kind} half duplicates {name}")
+                    all_tensor_names.add(name)
+                for expert in range(n_experts):
+                    offset = tensor.offset + expert * expert_bytes + index * part_bytes
+                    aligned = offset % ALIGNMENT == 0 and part_bytes % ALIGNMENT == 0
+                    if not aligned:
+                        unaligned_rows += 1
+                        if require_aligned:
+                            raise RuntimeError(
+                                f"{name}:{expert}: unaligned offset={offset} nbytes={part_bytes}"
+                            )
+                    rows.append(
+                        dict(
+                            tensor=name,
+                            expert_idx=expert,
+                            nbytes=part_bytes,
+                            source_path=str(header.path),
+                            offset=offset,
+                            kind=kind,
+                            layer=layer,
+                            type=type_name,
+                            aligned=int(aligned),
+                            shard_index=shard_index,
                         )
-                rows.append(
-                    dict(
-                        tensor=tensor.name,
-                        expert_idx=expert,
-                        nbytes=expert_bytes,
-                        source_path=str(header.path),
-                        offset=offset,
-                        kind=kind,
-                        layer=int(match.group("layer")),
-                        type=type_name,
-                        aligned=int(aligned),
-                        shard_index=shard_index,
                     )
-                )
-            for bucket in (by_kind[kind], by_type[type_name]):
-                bucket["tensors"] += 1
-                bucket["entries"] += n_experts
-                bucket["bytes"] += tensor.nbytes
-            total_bytes += tensor.nbytes
+                for bucket in (by_kind[kind], by_type[type_name]):
+                    bucket["tensors"] += 1
+                    bucket["entries"] += n_experts
+                    bucket["bytes"] += part_bytes * n_experts
+                total_bytes += part_bytes * n_experts
     if not rows:
         raise RuntimeError("no expert tensors matched the requested kinds")
     if any(header.identity != _identity(header.path.stat()) for header in headers):

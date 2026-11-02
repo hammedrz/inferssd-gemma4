@@ -36,7 +36,7 @@ struct fixture {
     llama_ssd::expert_inputs inputs() const {
         return {true, true, &up, &gate, &down, nullptr, nullptr, nullptr,
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-            256, 1, true, false, false, false, false, &norm, 1e-5f, 0.0f};
+            256, 1, true, false, false, false, false, false, &norm, 1e-5f, 0.0f};
     }
 };
 
@@ -293,6 +293,32 @@ void refusal_reasons() {
     CHECK(refusal_of(LLM_ARCH_MUSE_SPARK, in) == refusal::missing_post_norm);
 }
 
+// Gemma 4 as published: GELU-gated experts whose up and gate are the halves of one merged tensor (the graph
+// describes them separately) and whose per-expert down scale the graph hands to the executor separately.
+void gemma4_experts() {
+    using refusal = llama_ssd::expert_refusal;
+    fixture f;
+    f.up = f.gate = tensor(GGML_TYPE_Q4_K, 2816, 704, 128);
+    f.down = tensor(GGML_TYPE_Q5_1, 704, 2816, 128);
+    auto in = f.inputs();
+    in.n_embd = 2816; in.post_norm = nullptr; in.silu = false; in.gelu = true;
+    const auto gemma = llama_ssd::describe_experts(LLM_ARCH_GEMMA4, llama_hparams{}, 0);
+    CHECK(gemma.activation == llama_ssd::expert_activation::geglu);
+    const auto accepted = llama_ssd::validate_experts(gemma, in);
+    CHECK(accepted.accepted());
+    CHECK(accepted.execution.activation == llama_ssd::expert_activation::geglu);
+    CHECK(!accepted.execution.post_norm);
+    auto silu = in; silu.silu = true; silu.gelu = false;
+    CHECK(refusal_of(LLM_ARCH_GEMMA4, silu) == refusal::not_gelu_gated);
+    CHECK(!llama_ssd::describe_refusal(silu, refusal::not_gelu_gated).empty());
+    auto scaled = in; scaled.down_scale = &f.norm;
+    CHECK(refusal_of(LLM_ARCH_GEMMA4, scaled) == refusal::extra_parameters);
+    auto merged = in; merged.gate_up = &f.up;
+    CHECK(refusal_of(LLM_ARCH_GEMMA4, merged) == refusal::layout);
+    // GELU experts never pass for a SiLU model.
+    CHECK(refusal_of(LLM_ARCH_QWEN4EXP, in) == refusal::not_silu_gated);
+}
+
 bool contains(const std::string & text, const char * part) { return text.find(part) != std::string::npos; }
 
 // DeepSeek-V4.1-Flash Q3_K_M as published: Q3_K up and gate, Q4_K down in most layers.
@@ -326,6 +352,7 @@ int main() {
     layout_refusals();
     quantization_contract();
     refusal_reasons();
+    gemma4_experts();
     quantization_refusals_name_the_types();
     std::printf("model adapter: %zu frozen acceptance/descriptor comparisons passed\n", comparisons);
 }

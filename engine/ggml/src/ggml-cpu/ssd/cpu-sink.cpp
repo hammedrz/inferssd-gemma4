@@ -734,6 +734,9 @@ struct kimi_cpu_sink {
     const char * up_data = nullptr, * gate_data = nullptr, * down_data = nullptr;
     float beta = 0, linear_beta = 0, weight = 0;
     const float * post_exp_norm = nullptr;
+    // The run's optional per-expert down multiplier and the current expert's entry (1 without one: exact).
+    const float * down_scale = nullptr;
+    float expert_scale = 1.0f;
     int activation_kind = KIMI_CPU_SINK_ACTIVATION_SITU;
     float swiglu_limit = 0;
     float * output = nullptr;
@@ -776,7 +779,9 @@ struct kimi_cpu_sink {
             const auto healthy = configuration.events->flush();
             if (!healthy) { throw std::runtime_error(healthy.error); }
         }
-        // Kernels are selected per call from the expert tensor types in prepare().
+        // Kernels are selected per call from the expert tensor types in prepare(). GEGLU's kernel reads ggml's fp16
+        // GELU table, which ggml_cpu_init fills once; a sink made before any CPU backend must not find it empty.
+        ggml_cpu_init();
         if (dynamic_rows && !row_weights.empty()) {
             throw std::runtime_error("DYNAMIC_ROWS and ROW_WEIGHTS are mutually exclusive row schedulers");
         }
@@ -1362,7 +1367,8 @@ struct kimi_cpu_sink {
                         const float up_value = std::clamp(u, -limit, limit);
                         activation[row] = gate_value / (1.f + expf(-gate_value)) * up_value;
                     }
-                } else if (!is_down && activation_kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU) {
+                } else if (!is_down && (activation_kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU ||
+                        activation_kind == KIMI_CPU_SINK_ACTIVATION_GEGLU)) {
                     // g and u as they are: the coordinator gates the whole row (quantize_activation)
                     for (int row = begin; row < end; ++row) {
                         dot_up(latent, &activation_up[row], 0, up_data + row * row_bytes_up, 0, quant_input.data(), 0, 1);
@@ -1381,9 +1387,11 @@ struct kimi_cpu_sink {
                     for (int row = begin; row < end; ++row) {
                         float value;
                         dot_down(hidden, &value, 0, down_data + row * row_bytes_down, 0, down_quant_data, 0, 1);
-                        // Preserve the separate multiply followed by the graph's slot-order
-                        // addition even when the compiler enables floating point contraction.
-                        volatile float scaled = post_exp_norm ? value : value * weight;
+                        // Preserve the separate multiplies followed by the graph's slot-order
+                        // addition even when the compiler enables floating point contraction:
+                        // the expert's down scale, then (after any post norm) the routing weight.
+                        const float down_value = value * expert_scale;
+                        volatile float scaled = post_exp_norm ? down_value : down_value * weight;
                         if (ready_first || first_down) { output[row] = scaled; }
                         else { output[row] += scaled; }
                     }
@@ -1906,11 +1914,13 @@ struct kimi_cpu_sink {
         wait_workers();
     }
 
-    // The hidden row of the last up/gate phase, quantized for down. SWIGLU gates it first with the graph's kernel
-    // over the whole row: split elsewhere than at its vector width, elements would move into its scalar tail.
+    // The hidden row of the last up/gate phase, quantized for down. SWIGLU and GEGLU gate it first with the graph's
+    // kernel over the whole row: split elsewhere than at its vector width, elements would move into its scalar tail.
     void quantize_activation(void * destination) {
         if (activation_kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU) {
             ggml_vec_swiglu_f32(hidden, activation.data(), activation.data(), activation_up.data());
+        } else if (activation_kind == KIMI_CPU_SINK_ACTIVATION_GEGLU) {
+            ggml_vec_geglu_f32(hidden, activation.data(), activation.data(), activation_up.data());
         }
         quantize_hidden(activation.data(), destination, hidden);
     }
@@ -2540,7 +2550,8 @@ struct kimi_cpu_sink {
         current.ring_bytes = allocated;
         current.experts = requests.size();
         resize_scratch(activation, hidden);
-        resize_scratch(activation_up, activation_kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU ? size_t(hidden) : 0);
+        resize_scratch(activation_up, activation_kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU ||
+            activation_kind == KIMI_CPU_SINK_ACTIVATION_GEGLU ? size_t(hidden) : 0);
         resize_scratch(quant_input, ggml_row_size(up_traits->vec_dot_type, latent));
         quant_hidden_stride = ggml_row_size(down_traits->vec_dot_type, hidden);
         resize_scratch(quant_hidden, quant_hidden_stride);
@@ -2656,6 +2667,7 @@ struct kimi_cpu_sink {
             gate_data = static_cast<const char *>(data[1]);
             down_data = static_cast<const char *>(data[2]);
             weight = request.weight;
+            expert_scale = down_scale ? down_scale[request.id] : 1.0f;
             output = expert_output.data() + expert * size_t(latent);
             timeline_expert = expert;
 
@@ -2857,6 +2869,11 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         }
         if (sink->poisoned) { throw std::runtime_error("CPU sink ring is poisoned after an I/O failure"); }
         sink->post_exp_norm = batch->activation.post_exp_norm;
+        // Grouped prefill computes its CPU routes itself and applies the down scale there.
+        sink->down_scale = batch->activation.down_scale;
+        if (sink->down_scale && sink->vram.context) {
+            throw std::runtime_error("a per-expert down scale runs on the CPU only, without a GPU expert tier");
+        }
         sink->activation_kind = batch->activation.kind;
         sink->beta = batch->activation.situ_beta;
         sink->linear_beta = batch->activation.situ_linear_beta;
@@ -3468,6 +3485,7 @@ static bool sink_activation_valid(const kimi_cpu_sink_activation * activation) {
         case KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP:
             return !std::isnan(activation->swiglu_limit) && activation->swiglu_limit > 1e-6f;
         case KIMI_CPU_SINK_ACTIVATION_SWIGLU:
+        case KIMI_CPU_SINK_ACTIVATION_GEGLU:
             return true;
         default:
             return false;
@@ -3555,6 +3573,10 @@ extern "C" bool kimi_cpu_sink_run_activation(
         if (sink->post_exp_norm && (!sink->ready_first || !std::isfinite(activation->post_exp_norm_eps) ||
                 activation->post_exp_norm_eps <= 0.0f)) {
             throw std::runtime_error("per-expert post norm requires READY_FIRST=1 and positive finite epsilon");
+        }
+        sink->down_scale = activation->down_scale;
+        if (sink->down_scale && sink->vram.context) {
+            throw std::runtime_error("a per-expert down scale runs on the CPU only, without a GPU expert tier");
         }
         sink->activation_kind = activation->kind;
         sink->beta = activation->situ_beta; sink->linear_beta = activation->situ_linear_beta;
@@ -3651,6 +3673,7 @@ extern "C" bool kimi_cpu_sink_run_activation(
             sink->gate_data = static_cast<const char *>(data[1]);
             sink->down_data = static_cast<const char *>(data[2]);
             sink->weight = request.weight;
+            sink->expert_scale = sink->down_scale ? sink->down_scale[request.id] : 1.0f;
             double down_wait_us = 0;
             if (sink->timeline_active) { sink->timeline_expert = expert; }
             auto phase_start = sink_clock::now();

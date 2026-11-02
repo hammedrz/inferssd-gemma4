@@ -2257,6 +2257,8 @@ static std::vector<float> reference_moe_graph(const fixture & f, int layer, cons
         act = ggml_swiglu_clamp(ctx, gate, up, activation.swiglu_limit);
     } else if (activation.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU) {
         act = ggml_swiglu_split(ctx, gate, up);
+    } else if (activation.kind == KIMI_CPU_SINK_ACTIVATION_GEGLU) {
+        act = ggml_geglu_split(ctx, gate, up);
     } else {
         const float beta = activation.situ_beta, lb = activation.situ_linear_beta;
         act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 1.0f / beta)), beta);
@@ -2265,6 +2267,12 @@ static std::vector<float> reference_moe_graph(const fixture & f, int layer, cons
         act = ggml_mul(ctx, act, up);
     }
     ggml_tensor * down = ggml_mul_mat_id(ctx, experts[2], act, selected);
+    ggml_tensor * down_scale = nullptr;
+    if (activation.down_scale) {
+        // build_moe_ffn's per-expert scale: the selected experts' entries times the down output
+        down_scale = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, f.experts, 1);
+        down = ggml_mul(ctx, down, ggml_get_rows(ctx, down_scale, selected));
+    }
     ggml_tensor * norm_weight = nullptr;
     if (activation.post_exp_norm) {
         norm_weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, f.latent);
@@ -2288,6 +2296,9 @@ static std::vector<float> reference_moe_graph(const fixture & f, int layer, cons
             require(item.raw_bytes == experts[role]->nb[2], "MoE reference expert stride mismatch");
             ggml_backend_tensor_set(experts[role], item.data.data(), size_t(e) * experts[role]->nb[2], item.raw_bytes);
         }
+    }
+    if (down_scale) {
+        ggml_backend_tensor_set(down_scale, activation.down_scale, 0, size_t(f.experts) * sizeof(float));
     }
     if (norm_weight) {
         ggml_backend_tensor_set(norm_weight, activation.post_exp_norm, 0, size_t(f.latent) * sizeof(float));
@@ -3192,6 +3203,72 @@ static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
     }
     activation_case(inputs, "mxfp4_swiglu_clamp_after_refusals", f, sink.get(), 1, input, top6, w6, clamp10);
     std::printf("CPU_SINK_ACTIVATION_OK threads=%d ring_experts=%d refusals=%d\n", threads, depth, refusals);
+}
+
+// Gemma 4 expert semantics against the ordinary ggml MoE graph (ggml_geglu_split, then the per-expert down scale),
+// bit for bit, in decode and in 3- and 65-token grouped prefill. The graph gives the executor its merged gate_up as
+// separate halves; the executor multiplies each expert's down output by its scale before the routing weight.
+static void gemma4_geglu_test(fixture_inputs & inputs, int threads, int depth, ggml_type type, ggml_type down_type,
+        bool with_scale) {
+    fixture f; f.type = type; f.down_type = down_type; make_synthetic(f, 20261102);
+    auto sink = make_sink(inputs, f, threads, depth);
+    tensors meta(f, 1);
+    std::vector<float> input(f.latent);
+    for (int row = 0; row < f.latent; ++row) { input[row] = 0.17f * std::sin(float(row) * .31f); }
+    const std::vector<int32_t> ids = { 9, 1, 17, 6, 3, 12, 0, 15 };
+    const std::vector<float> weights = { .21f, .19f, .15f, .13f, .11f, .09f, .07f, .05f };
+    // Published Gemma 4 scales lie in 0.98..1.03; distinct values per expert catch a wrong index.
+    std::vector<float> scales(size_t(f.experts));
+    for (int e = 0; e < f.experts; ++e) { scales[size_t(e)] = 0.98f + 0.0023f * float(e); }
+    const kimi_cpu_sink_activation activation = { KIMI_CPU_SINK_ACTIVATION_GEGLU, 0.0f, 0.0f, 0.0f, nullptr, 0.0f,
+        with_scale ? scales.data() : nullptr };
+    char error[512] = {};
+    auto compare = [&](const std::vector<float> & actual, const std::vector<float> & expected, const char * phase) {
+        require(actual.size() == expected.size(), "Gemma 4 output size");
+        if (std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float))) {
+            size_t differing = 0; float worst = 0.0f, scale = 0.0f;
+            for (size_t i = 0; i < actual.size(); ++i) {
+                differing += actual[i] != expected[i];
+                worst = std::max(worst, std::fabs(actual[i] - expected[i]));
+                scale = std::max(scale, std::fabs(expected[i]));
+            }
+            std::printf("GEMMA4_GEGLU_COMPARE phase=%s up_gate=%s down=%s scale=%d differing=%zu/%zu max_abs_diff=%g "
+                "max_abs=%g FAIL\n", phase, ggml_type_name(type), ggml_type_name(down_type), int(with_scale),
+                differing, actual.size(), worst, scale);
+            require(false, "Gemma 4 GELU experts differ from the graph");
+        }
+        std::printf("GEMMA4_GEGLU_COMPARE phase=%s up_gate=%s down=%s scale=%d values=%zu bit_exact=1 PASS\n", phase,
+            ggml_type_name(type), ggml_type_name(down_type), int(with_scale), actual.size());
+    };
+    {
+        std::vector<float> actual(f.latent);
+        kimi_cpu_sink_stats stats = {};
+        require(kimi_cpu_sink_run_activation(sink.get(), meta.role[0], meta.role[1], meta.role[2],
+            input.data(), ids.data(), weights.data(), 8, &activation, actual.data(), &stats, error, sizeof(error)), error);
+        compare(actual, reference_moe_graph(f, 1, input, ids, weights, activation, 1), "decode");
+        require(stats.experts == 8 && stats.read_requests == 24 && stats.pending_reads == 0 && !stats.read_errors,
+            "Gemma 4 decode I/O counters");
+    }
+    auto * prefill = kimi_cpu_prefill_create(sink.get(), error, sizeof(error)); require(prefill, error);
+    for (int tokens : { 3, 65 }) {
+        std::vector<float> x, w, expected;
+        std::vector<int32_t> selected;
+        for (int token = 0; token < tokens; ++token) {
+            auto xt = input; auto it = ids;
+            for (auto & value : xt) { value += float(token) * .003f; }
+            for (auto & id : it) { id = (id + token) % f.experts; }
+            auto y = reference_moe_graph(f, 1, xt, it, weights, activation, 1);
+            x.insert(x.end(), xt.begin(), xt.end()); selected.insert(selected.end(), it.begin(), it.end());
+            w.insert(w.end(), weights.begin(), weights.end()); expected.insert(expected.end(), y.begin(), y.end());
+        }
+        std::vector<float> actual(expected.size()); kimi_cpu_prefill_stats stats = {};
+        require(kimi_cpu_prefill_run_activation(prefill, meta.role[0], meta.role[1], meta.role[2],
+            x.data(), selected.data(), w.data(), 8, tokens, &activation, actual.data(), &stats, error, sizeof(error)), error);
+        compare(actual, expected, tokens == 3 ? "prefill3" : "prefill65");
+        require(stats.stream.pending_reads == 0 && !stats.stream.read_errors && !stats.stream.fallback_count,
+            "Gemma 4 prefill I/O counters");
+    }
+    kimi_cpu_prefill_destroy(prefill);
 }
 
 // Native Muse expert semantics against the ordinary ggml MoE graph Muse builds (ggml_swiglu_split, then mul and
@@ -4124,6 +4201,7 @@ int main(int argc, char ** argv) {
         bool poll_mode = false, poll_early_mode = false, cache_compute_mode = false, cache_location_mode = false;
         bool cache_policy_mode = false, cache_large_mode = false, cache_pressure_transition = false, cache_unbounded = false;
         bool activation_mode = false, q2_activation_mode = false, muse_q8_mode = false, muse_bf16_mode = false;
+        bool gemma4_mode = false;
         bool auto_ring_mode = false, prefetch_mode = false, cache_load_mode = false, work_reclaim_mode = false, threadpool_mode = false;
         bool swiglu_mode = false;
         std::string pack, prefix;
@@ -4165,6 +4243,7 @@ int main(int argc, char ** argv) {
             else if (!std::strcmp(argv[i], "--cache-unbounded")) { cache_unbounded = true; }
             else if (!std::strcmp(argv[i], "--auto-cache-ring-test")) { auto_ring_mode = true; }
             else if (!std::strcmp(argv[i], "--muse-q8-test")) { muse_q8_mode = true; }
+            else if (!std::strcmp(argv[i], "--gemma4-geglu-test")) { gemma4_mode = true; }
             else if (!std::strcmp(argv[i], "--muse-bf16-test")) { muse_bf16_mode = true; }
             else if (!std::strcmp(argv[i], "--activation-tests")) { activation_mode = true; }
             else if (!std::strcmp(argv[i], "--q2-activation-test")) { q2_activation_mode = true; }
@@ -4182,7 +4261,8 @@ int main(int argc, char ** argv) {
         if (cache_mode || hitrate_mode || elastic_cache_mode || cache_load_mode || work_reclaim_mode || max_cache_mode ||
                 cache_location_mode || cache_compute_mode || early_up_gate_mode ||
                 role_major_mode || nonblocking_down_mode || poll_mode || poll_early_mode || schedules_mode ||
-                prefetch_mode || cache_policy_mode || cache_large_mode || activation_mode || muse_q8_mode || muse_bf16_mode) {
+                prefetch_mode || cache_policy_mode || cache_large_mode || activation_mode || muse_q8_mode || muse_bf16_mode ||
+                gemma4_mode) {
             test_resources::finite_envelope();
         }
 #if defined(__linux__)
@@ -4202,6 +4282,13 @@ int main(int argc, char ** argv) {
         }
 #endif
         if (muse_q8_mode) { muse_expert_norm_test(inputs, options.threads, ring_set ? options.ring_experts : 2, GGML_TYPE_Q8_0); return 0; }
+        if (gemma4_mode) {
+            const int depth = ring_set ? options.ring_experts : 2;
+            gemma4_geglu_test(inputs, options.threads, depth, GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, true);
+            gemma4_geglu_test(inputs, options.threads, depth, GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, false);
+            gemma4_geglu_test(inputs, options.threads, depth, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true);
+            return 0;
+        }
         if (muse_bf16_mode) {
             muse_expert_norm_test(inputs, options.threads, ring_set ? options.ring_experts : 2, GGML_TYPE_BF16);
             muse_expert_norm_test(inputs, options.threads, ring_set ? options.ring_experts : 2, GGML_TYPE_BF16, true);

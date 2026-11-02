@@ -30,7 +30,7 @@ from inferssd.machine.characteristics import (
     record,
 )
 from inferssd.source import header as gguf_header
-from inferssd.source.experts import ROLE, is_role, widened
+from inferssd.source.experts import MERGED, ROLE, is_merged, is_role, widened
 from inferssd.source.files import LOCAL_FILES, SourceFiles
 
 ROLES = ("gate", "up", "down")
@@ -102,7 +102,7 @@ def facts_from_headers(headers: Sequence[gguf_header.Header]) -> ModelFacts:
         for key, value in item.kv.items():
             kv.setdefault(key, value)
     tensors = [tensor for item in headers for tensor in item.tensors]
-    routed = [tensor for tensor in tensors if is_role(tensor)]
+    routed = [tensor for tensor in tensors if is_role(tensor) or is_merged(tensor)]
     if not routed:
         raise ValueError(f"{headers[0].path}: the model has no routed expert tensors")
     counts = {tensor.shape[2] for tensor in routed}
@@ -115,15 +115,21 @@ def facts_from_headers(headers: Sequence[gguf_header.Header]) -> ModelFacts:
     expert: Counter[tuple[int, int]] = Counter()
     read: Counter[tuple[int, int]] = Counter()
     for tensor in routed:
-        match = cast(re.Match[str], ROLE.match(tensor.name))
-        layer, role = int(match.group(1)), match.group(2)
-        formats[role][tensor.type_name] += 1
-        shapes[role][(tensor.shape[1], tensor.shape[0])] += 1
+        # A merged gate_up tensor counts as its gate and up halves, each read on its own.
+        merged = MERGED.match(tensor.name)
+        match = merged or cast(re.Match[str], ROLE.match(tensor.name))
+        layer = int(match.group(1))
+        parts = ("gate", "up") if merged else (match.group(2),)
+        for role in parts:
+            formats[role][tensor.type_name] += 1
+            shapes[role][(tensor.shape[1] // len(parts), tensor.shape[0])] += 1
         per_format[tensor.type_name] += tensor.nbytes
         size = tensor.nbytes // experts
+        part = size // len(parts)
         for index in range(experts):
             expert[(layer, index)] += size
-            read[(layer, index)] += widened(tensor.offset + index * size, size)
+            for half in range(len(parts)):
+                read[(layer, index)] += widened(tensor.offset + index * size + half * part, part)
     missing = [role for role in ROLES if not formats[role]]
     if missing:
         raise ValueError("the model has no routed " + " or ".join(missing) + " expert tensors")
@@ -148,7 +154,9 @@ def facts_from_headers(headers: Sequence[gguf_header.Header]) -> ModelFacts:
         down=roles["down"],
         expert_bytes=max(expert.values()),
         expert_read_bytes=max(read.values()),
-        dense_bytes=sum(tensor.nbytes for tensor in tensors if not is_role(tensor)),
+        dense_bytes=sum(
+            tensor.nbytes for tensor in tensors if not (is_role(tensor) or is_merged(tensor))
+        ),
         format_bytes=_ranked(per_format),
     )
 

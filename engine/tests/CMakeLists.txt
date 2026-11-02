@@ -433,6 +433,10 @@ if (TARGET ggml-cpu)
     add_test(NAME kimi_cpu_sink_muse_q8_0 COMMAND test-kimi-cpu-sink --muse-q8-test --threads 2)
     add_test(NAME kimi_cpu_sink_muse_bf16 COMMAND test-kimi-cpu-sink --muse-bf16-test --threads 2)
     set_tests_properties(kimi_cpu_sink_muse_q8_0 kimi_cpu_sink_muse_bf16 PROPERTIES TIMEOUT 180)
+    # Gemma 4's GELU-gated experts (Q4_K up/gate with Q5_1 down, and Q8_0) in decode and grouped prefill, against
+    # the MoE graph's ggml_geglu_split, bit for bit.
+    add_test(NAME kimi_cpu_sink_gemma4_geglu COMMAND test-kimi-cpu-sink --gemma4-geglu-test --threads 2)
+    set_tests_properties(kimi_cpu_sink_gemma4_geglu PROPERTIES TIMEOUT 180)
     # A decode microbenchmark, not a CTest: test-kimi-sink-bench --help.
     add_executable(test-kimi-sink-bench ssd/test-kimi-sink-bench.cpp)
     target_include_directories(test-kimi-sink-bench PRIVATE ../ggml/src ../ggml/src/ggml-cpu)

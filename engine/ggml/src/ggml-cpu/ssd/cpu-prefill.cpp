@@ -47,6 +47,7 @@ static bool prefill_activation_valid(const kimi_cpu_sink_activation * activation
         case KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP:
             return !std::isnan(activation->swiglu_limit) && activation->swiglu_limit > 1e-6f;
         case KIMI_CPU_SINK_ACTIVATION_SWIGLU:
+        case KIMI_CPU_SINK_ACTIVATION_GEGLU:
             return true;
         default:
             return false;
@@ -209,11 +210,13 @@ struct kimi_cpu_prefill {
             }
         }
         const size_t columns = static_cast<size_t>(current.max_group_tokens);
-        const bool swiglu = activation_config.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU;
+        // SWIGLU and GEGLU keep g and u apart until the chunk is gated.
+        const bool split_glu = activation_config.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU ||
+            activation_config.kind == KIMI_CPU_SINK_ACTIVATION_GEGLU;
         // Each CPU route's weighted output, for the graph's slot-order sum per
         // token. A route the GPU tier serves is never written or read here.
         const uint64_t routed = uint64_t(ntokens) * uint64_t(nslots) * uint64_t(latent) * sizeof(float);
-        const uint64_t scratch = (uint64_t(columns) * hidden * (swiglu ? 2 : 1) +
+        const uint64_t scratch = (uint64_t(columns) * hidden * (split_glu ? 2 : 1) +
                 (activation_config.post_exp_norm ? uint64_t(columns) * latent : 0)) * sizeof(float) +
                 uint64_t(columns) * quant_bytes_hidden + uint64_t(ntokens) * quant_bytes_input;
         if (routed + scratch > prefill_workspace_max) {
@@ -222,7 +225,7 @@ struct kimi_cpu_prefill {
                 std::to_string(prefill_workspace_max >> 20) + " MiB limit: use a smaller ubatch");
         }
         activation.resize(columns * hidden);
-        activation_up.resize(swiglu ? columns * hidden : 0);
+        activation_up.resize(split_glu ? columns * hidden : 0);
         post_exp_output.resize(activation_config.post_exp_norm ? columns * latent : 0);
         quant_hidden.resize(columns * quant_bytes_hidden);
         quant_input.resize(static_cast<size_t>(ntokens) * quant_bytes_input);
@@ -245,6 +248,9 @@ struct kimi_cpu_prefill {
         auto & self = *static_cast<kimi_cpu_prefill *>(userdata);
         const auto & columns = self.active_group->columns;
         const int rows = self.down_phase ? self.latent : self.hidden;
+        // The expert's down multiplier, before any post norm and the routing weight (1 without one: exact).
+        const float expert_scale = self.activation_config.down_scale ?
+            self.activation_config.down_scale[self.active_group->expert] : 1.0f;
         auto compute_range = [&](int begin, int end) {
         // Keep a weight row hot across token columns while preserving each dot's reductions.
         const size_t tile = self.active_mxfp4_gemm == 2 ? 4 : self.active_mxfp4_gemm == 1 ? 2 : 1;
@@ -280,7 +286,8 @@ struct kimi_cpu_prefill {
                     }
                     for (size_t offset = 0; offset < count; ++offset) {
                         float value;
-                        if (self.activation_config.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU) {
+                        if (self.activation_config.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU ||
+                                self.activation_config.kind == KIMI_CPU_SINK_ACTIVATION_GEGLU) {
                             // g and u as they are: the chunk is gated once complete
                             self.activation_up[(column + offset) * self.hidden + row] = u[offset];
                             value = g[offset];
@@ -321,13 +328,14 @@ struct kimi_cpu_prefill {
                     }
                     for (size_t offset = 0; offset < count; ++offset) {
                         const auto & current = columns[column + offset];
+                        const float down_value = values[offset] * expert_scale;
                         if (self.activation_config.post_exp_norm) {
-                            self.post_exp_output[(column + offset) * self.latent + row] = values[offset];
+                            self.post_exp_output[(column + offset) * self.latent + row] = down_value;
                         } else {
                             for (int route : current.slots) {
                                 // Store each slot's separate multiplication before
                                 // the final ordered additions. Never fuse scale/sum.
-                                volatile float scaled = values[offset] * self.weights[route];
+                                volatile float scaled = down_value * self.weights[route];
                                 self.routed_output[static_cast<size_t>(route) * self.latent + row] = scaled;
                             }
                         }
@@ -353,6 +361,12 @@ struct kimi_cpu_prefill {
             for (size_t column = 0; column < columns.size(); ++column) {
                 float * gate = self.activation.data() + column * self.hidden + begin;
                 ggml_vec_swiglu_f32(end - begin, gate, gate, self.activation_up.data() + column * self.hidden + begin);
+            }
+        } else if (!self.down_phase && self.activation_config.kind == KIMI_CPU_SINK_ACTIVATION_GEGLU) {
+            // ggml_geglu_split's kernel, element by element, on the same chunk
+            for (size_t column = 0; column < columns.size(); ++column) {
+                float * gate = self.activation.data() + column * self.hidden + begin;
+                ggml_vec_geglu_f32(end - begin, gate, gate, self.activation_up.data() + column * self.hidden + begin);
             }
         }
         };

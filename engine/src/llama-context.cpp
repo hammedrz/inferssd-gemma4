@@ -309,22 +309,23 @@ llama_context::llama_context(
             // After the backends: the sink has a GPU tier only when one of them injected its provider.
             if (cpu_sink_enabled) {
                 std::vector<int32_t> routed_layers;
+                std::vector<llama_ssd_layer_experts> layer_experts;
                 for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
                     const auto & layer = model.layers[il];
-                    if (layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps) {
+                    llama_ssd_layer_experts experts;
+                    if (llama_ssd_describe_layer_experts(layer.ffn_up_exps, layer.ffn_gate_exps,
+                            layer.ffn_gate_up_exps, layer.ffn_down_exps, experts)) {
                         routed_layers.push_back(int32_t(il));
+                        layer_experts.push_back(experts);
                     }
                 }
                 cpu_sink_runtime = std::make_unique<llama_kimi_cpu_sink_runtime>(model.hparams.n_layer,
                     kimi_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed),
                     int64_t(model.hparams.n_expert), routed_layers, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources);
                 if (*ssd_runtime->settings.integer("prefetch.depth") > 0) {
-                    for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
-                        const auto & layer = model.layers[il];
-                        for (const ggml_tensor * experts : {layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps}) {
-                            if (experts) {
-                                cpu_sink_runtime->expert_shapes[ggml_get_name(experts)] = {experts->nb[2], experts->ne[2]};
-                            }
+                    for (const auto & layer : layer_experts) {
+                        for (const ggml_tensor * experts : {&layer.up, &layer.gate, &layer.down}) {
+                            cpu_sink_runtime->expert_shapes[ggml_get_name(experts)] = {experts->nb[2], experts->ne[2]};
                         }
                     }
                 }
@@ -457,9 +458,11 @@ llama_context::llama_context(
         // request's path. Any routed layer gives the experts' format.
         if (cpu_sink_runtime && (cpu_sink_runtime->vram_budget || cpu_sink_runtime->cache_budget) && backend_cpu) {
             for (const auto & layer : model.layers) {
-                if (layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps) {
+                llama_ssd_layer_experts experts;
+                if (llama_ssd_describe_layer_experts(layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_gate_up_exps,
+                        layer.ffn_down_exps, experts)) {
                     cpu_sink_runtime->reserve_tier(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)),
-                        layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps, int(model.hparams.n_expert_used));
+                        &experts.up, &experts.gate, &experts.down, int(model.hparams.n_expert_used));
                     break;
                 }
             }

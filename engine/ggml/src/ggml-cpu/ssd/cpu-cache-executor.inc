@@ -206,6 +206,7 @@ extern "C" bool kimi_cpu_sink_run_cache_compute(kimi_cpu_sink * sink,
         a.prepared_us=ggml_time_us();
         sink->activation_kind=KIMI_CPU_SINK_ACTIVATION_SITU;sink->swiglu_limit=0.0f;
         sink->beta=situ_beta;sink->linear_beta=situ_linear_beta;sink->weight=1.0f;
+        sink->down_scale=nullptr;sink->expert_scale=1.0f;
         auto phase=sink_clock::now();sink->quantize_input(input,sink->quant_input.data(),sink->latent);
         sink->current.input_quantize_us=elapsed_us(phase);sink->current.compute_us+=sink->current.input_quantize_us;
         std::fill(output,output+sink->latent,0.0f);

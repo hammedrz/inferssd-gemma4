@@ -29,10 +29,16 @@ class RandomChoice(Protocol):
 
 PAGE = 4096
 ROLE = re.compile("^blk\\.(\\d+)\\.ffn_(gate|up|down)_exps\\.weight$")
+# Gate and up in one tensor: each expert's gate rows, then its up rows (Gemma 4).
+MERGED = re.compile("^blk\\.(\\d+)\\.ffn_gate_up_exps\\.weight$")
 
 
 def is_role(t: Tensor) -> bool:
     return bool(ROLE.match(t.name)) and len(t.shape) == 3
+
+
+def is_merged(t: Tensor) -> bool:
+    return bool(MERGED.match(t.name)) and len(t.shape) == 3 and t.shape[1] % 2 == 0
 
 
 def gguf_tensors(model: str, *, filesystem: SourceFiles = LOCAL_FILES) -> list[Tensor]:

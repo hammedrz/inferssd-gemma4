@@ -38,6 +38,8 @@ struct llama_kimi_cpu_sink_node {
     int layer;
     bool post_exp_norm = false;
     float post_exp_norm_eps = 0.0f;
+    // The per-expert down scale, the node's seventh source.
+    bool down_scale = false;
     bool prefill = false;
     bool cache_compute = false;
     bool guarded = false;
@@ -401,6 +403,12 @@ inline void llama_kimi_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, voi
         activation.post_exp_norm = static_cast<const float *>(norm->data);
         activation.post_exp_norm_eps = node.post_exp_norm_eps;
     }
+    if (node.down_scale) {
+        const ggml_tensor * scale = dst->src[6];
+        GGML_ASSERT(scale && scale->type == GGML_TYPE_F32 && ggml_is_contiguous(scale));
+        GGML_ASSERT(ggml_nelements(scale) == node.down.ne[2]);
+        activation.down_scale = static_cast<const float *>(scale->data);
+    }
     const bool situ = node.activation.kind == KIMI_CPU_SINK_ACTIVATION_SITU;
     GGML_ASSERT(situ || !node.cache_compute);
     if (node.prefill) {
@@ -524,4 +532,39 @@ inline ggml_tensor llama_kimi_cpu_sink_metadata(const ggml_tensor * tensor) {
     result.view_src = nullptr;
     std::memset(result.src, 0, sizeof(result.src));
     return result;
+}
+
+// A layer's routed experts as the executor reads them: separate up, gate and down. A merged
+// blk.N.ffn_gate_up_exps.weight [latent, 2*hidden, experts] holds each expert's gate rows, then
+// its up rows (the graph's split views); each half becomes a contiguous description named as the
+// separate tensor, which the expert index (gguf_alias) resolves to that half of the expert's bytes.
+struct llama_ssd_layer_experts {
+    ggml_tensor up;
+    ggml_tensor gate;
+    ggml_tensor down;
+};
+
+inline bool llama_ssd_describe_layer_experts(const ggml_tensor * up, const ggml_tensor * gate,
+        const ggml_tensor * gate_up, const ggml_tensor * down, llama_ssd_layer_experts & out) {
+    if (!down) { return false; }
+    if (up && gate && !gate_up) {
+        out = { llama_kimi_cpu_sink_metadata(up), llama_kimi_cpu_sink_metadata(gate), llama_kimi_cpu_sink_metadata(down) };
+        return true;
+    }
+    int layer = -1, consumed = 0;
+    if (up || gate || !gate_up || !ggml_is_contiguous(gate_up) || gate_up->ne[1] % 2 || gate_up->ne[3] != 1 ||
+            std::sscanf(gate_up->name, "blk.%d.ffn_gate_up_exps.weight%n", &layer, &consumed) != 1 ||
+            !consumed || gate_up->name[consumed]) {
+        return false;
+    }
+    ggml_tensor half = llama_kimi_cpu_sink_metadata(gate_up);
+    half.ne[1] = gate_up->ne[1] / 2;
+    half.nb[2] = half.nb[1] * size_t(half.ne[1]);
+    half.nb[3] = half.nb[2] * size_t(half.ne[2]);
+    out.gate = half;
+    out.up = half;
+    std::snprintf(out.gate.name, sizeof(out.gate.name), "blk.%d.ffn_gate_exps.weight", layer);
+    std::snprintf(out.up.name, sizeof(out.up.name), "blk.%d.ffn_up_exps.weight", layer);
+    out.down = llama_kimi_cpu_sink_metadata(down);
+    return true;
 }

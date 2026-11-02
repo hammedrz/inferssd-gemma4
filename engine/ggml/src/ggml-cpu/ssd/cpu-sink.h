@@ -152,10 +152,13 @@ GGML_BACKEND_API bool kimi_cpu_sink_run(
 // L is SwiGLU in value but not in bits: the graph's SwiGLU kernel is vectorized.
 // SWIGLU: silu(g) * u as GGML_GLU_OP_SWIGLU (ggml_swiglu_split) computes it, the
 // vectorized CPU kernel over each whole hidden row; no parameter.
+// GEGLU (Gemma 4): gelu(g) * u as GGML_GLU_OP_GEGLU (ggml_geglu_split) computes it,
+// the same CPU kernel and row handling as SWIGLU; no parameter. CPU only.
 enum kimi_cpu_sink_activation_kind {
     KIMI_CPU_SINK_ACTIVATION_SITU         = 0,
     KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP = 1,
     KIMI_CPU_SINK_ACTIVATION_SWIGLU       = 2,
+    KIMI_CPU_SINK_ACTIVATION_GEGLU        = 3,
 };
 
 struct kimi_cpu_sink_activation {
@@ -165,6 +168,9 @@ struct kimi_cpu_sink_activation {
     float   swiglu_limit; // SWIGLU_CLAMP only
     const float * post_exp_norm; // optional latent-length weight, borrowed for run
     float post_exp_norm_eps;
+    // Optional per-expert multiplier of the down output (Gemma 4), one per expert of the tensors, borrowed for run:
+    // the graph's order, (down * scale) before the post norm and the routing weight. CPU only.
+    const float * down_scale;
 };
 
 // kimi_cpu_sink_run with an explicit activation. A configured GPU tier serves
